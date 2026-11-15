@@ -543,6 +543,29 @@ bool has_enhanced_layer(struct vframe_s *vf)
 
 #ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
 bool dvel_status;
+static struct vframe_s *el_wait_vf;
+static unsigned long el_wait_start;
+static bool el_drop_done;
+static struct vframe_s *el_mark_vf;
+static unsigned long el_mark_start;
+
+/*
+ * The decoder marks a base layer picture as dual layer only when the
+ * enhancement layer decoder starts on the matching picture. After a seek
+ * the first base layer picture is put out before that. Until the mark is
+ * set it looks like a single layer HDR10 frame, and showing it then makes
+ * amdv switch the output and the TV resync.
+ */
+static bool dv_el_mark_pending(struct vframe_s *vf)
+{
+	const char *prov;
+
+	if (!dvel_status || is_dovi_dual_layer_frame(vf))
+		return false;
+	prov = vf_get_provider_name("dvel");
+	return prov && !strcmp(prov, "dveldec");
+}
+
 int dolby_vision_need_wait(u8 path_index)
 {
 	struct vframe_s *vf;
@@ -551,8 +574,55 @@ int dolby_vision_need_wait(u8 path_index)
 		return 0;
 
 	vf = video_vf_peek(path_index);
-	if (!vf || (amdv_wait_metadata(vf, VD1_PATH) == 1))
+	if (!vf)
 		return 1;
+
+	/*
+	 * The enhancement layer of the last frame is still shown and its
+	 * decoder is registered, so give the decoder up to 200 ms to mark
+	 * this frame as dual layer before taking it as a single layer one.
+	 */
+	if (path_index == 0 && dv_el_mark_pending(vf)) {
+		if (el_mark_vf != vf) {
+			el_mark_vf = vf;
+			el_mark_start = jiffies;
+		}
+		if (time_before(jiffies, el_mark_start + msecs_to_jiffies(200)))
+			return 1;
+	} else {
+		el_mark_vf = NULL;
+	}
+
+	if (amdv_wait_metadata(vf, VD1_PATH) == 1)
+		return 1;
+
+	/*
+	 * A dual layer base layer frame without its enhancement layer frame
+	 * turns the enhancement layer off, and the base layer alone shows
+	 * black. This happens at the end of a short clip that holds its last
+	 * picture, when the decoder gives the base layer one picture more, and
+	 * at a stream start or after a seek, when the enhancement layer decoder
+	 * starts later than the base layer one.
+	 * Wait for the enhancement layer frame, keeping the last paired frame
+	 * on screen, and drop the base layer frame once if none comes.
+	 */
+	if (path_index == 0 && !el_drop_done &&
+	    is_dovi_dual_layer_frame(vf) && !vf_peek("dvel")) {
+		if (el_wait_vf != vf) {
+			el_wait_vf = vf;
+			el_wait_start = jiffies;
+		}
+		if (time_before(jiffies, el_wait_start + msecs_to_jiffies(500)))
+			return 1;
+		vf = amvideo_vf_get();
+		if (vf && amvideo_vf_put(vf) < 0)
+			pr_info("DV: put of unpaired bl %p failed\n", vf);
+		pr_info("DV: drop unpaired bl %p\n", vf);
+		el_wait_vf = NULL;
+		el_drop_done = true;
+		return 1;
+	}
+	el_wait_vf = NULL;
 
 	return 0;
 }
@@ -594,6 +664,7 @@ int dvel_swap_frame(struct vframe_s *vf)
 			(&vd_layer[1], vf, layer->cur_frame_par,
 			layer_info, __LINE__);
 		dvel_status = true;
+		el_drop_done = false;
 	} else if (dvel_status) {
 		dvel_changed = true;
 		dvel_status = false;
